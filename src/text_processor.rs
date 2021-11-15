@@ -5,10 +5,11 @@ use std::collections::{HashSet, HashMap};
 use futures::task::SpawnExt;
 use crate::message::{Messages, User};
 use std::iter::FromIterator;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt};
 use regex::Regex;
 use std::str::FromStr;
 use std::cmp::max;
+use rusqlite::Connection;
 
 pub fn parse_user(sender: String, regex: &Regex) -> Option<User> {
     return if regex.is_match(&sender) {
@@ -27,30 +28,22 @@ pub fn parse_user(sender: String, regex: &Regex) -> Option<User> {
     }
 }
 
-pub fn walk_messages(dir: &str) {
-    let threads = max(1, num_cpus::get());
-    let dir = fs::read_dir(dir).expect("Cannot read directory");
-
-    let thread_pool = ThreadPool::new().expect("Cannot create thread pool");
-
-    let mut jobs = vec![];
-
-    for x in dir {
-        let x = x.expect("Cannot read directory entry");
-        let path = x.path();
-        let job = async move {
-            let str = fs::read_to_string(&path).expect("Cannot read file");
-            let messages: Messages = serde_json::from_str(&str).expect(&format!("Cannot parse file {:?}", path));
-            messages.messages.iter().map(|x| x.sender.to_string()).collect::<Vec<String>>()
-        };
-        jobs.push(thread_pool.spawn_with_handle(job).expect("Cannot spawn"));
+pub fn get_senders() -> Option<HashSet<String>> {
+    let conn = Connection::open("msg.db").expect("Cannot open msg.db");
+    let mut statement = conn.prepare("SELECT sender FROM messages").unwrap();
+    let mut set = HashSet::new();
+    let mut rows = statement.query(rusqlite::params![]).unwrap();
+    while let Some(row) = rows.next().unwrap() {
+        set.insert(row.get::<usize, String>(0).unwrap() as String);
     }
+    Some(set)
+}
 
-    println!("Running {} jobs on {} threads", jobs.len(), threads);
+pub fn walk_messages(dir: &str) {
 
-    let users: HashMap<String, User> = block_on(async move {
+    let users: HashMap<String, User> = {
         let user_pattern = Regex::new(r"(?P<name>.+)((\((?P<qq>\d{6,})\))|(<(?P<email>.+@.+\..+)>))").unwrap();
-        let set: HashSet<String> = HashSet::from_iter(futures::future::join_all(jobs).await.into_iter().flat_map(|x| x));
+        let set: HashSet<String> = get_senders().unwrap();
         let mut map: HashMap<String, User> = HashMap::new();
         set.into_iter()
             .map(|x| parse_user(x, &user_pattern))
@@ -62,9 +55,9 @@ pub fn walk_messages(dir: &str) {
                 }
             );
         map
-    });
+    };
 
-    fs::write(format!("users.json"), serde_json::to_string(&users).expect("Cannot serialize")).expect("Cannot write");
+    fs::write(format!("users.json"), serde_json::to_string_pretty(&users).expect("Cannot serialize")).expect("Cannot write");
 
     println!("Parsed and wrote {} users to file", users.len());
 }

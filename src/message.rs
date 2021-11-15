@@ -33,8 +33,11 @@ pub struct Messages {
     pub messages: Vec<Message>
 }
 
-#[derive(Debug, Serialize, Deserialize, Default, Hash)]
+#[derive(Debug, Serialize, Deserialize, Default, Hash, Clone)]
 pub struct Message {
+    pub message_group: String,
+    pub subject: String,
+    pub is_group: bool,
     pub sender: String,
     pub time: String,
     pub text: String

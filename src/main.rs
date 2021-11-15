@@ -16,6 +16,11 @@ fn main() {
         .version("1.0")
         .author("Lasm Gratel <lasm_gratel@hotmail.com>")
         .about("分析QQ的纯文本消息记录")
+        .arg(Arg::new("cache")
+            .short('c')
+            .about("插入数据库的信息缓存")
+            .default_value("256")
+            .required(false))
         .arg(Arg::new("INPUT")
             .about("QQ导出的全部消息记录.txt")
             .required(true)
@@ -23,7 +28,7 @@ fn main() {
         .get_matches();
     if let Some(i) = matches.value_of("INPUT") {
         println!("Step 1: Split all messages");
-        analyze_text(i);
+        analyze_text(i, matches.value_of("cache").unwrap());
 
         println!("Step 2: Post-processing of users");
         walk_messages("messages");
