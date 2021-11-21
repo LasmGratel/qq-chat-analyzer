@@ -11,7 +11,8 @@ use crate::text_analyzer::analyze_text;
 use crate::text_processor::walk_messages;
 use clap::{Arg, App};
 
-fn main() {
+#[async_std::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = App::new("QQ Chat Analyzer")
         .version("1.0")
         .author("Lasm Gratel <lasm_gratel@hotmail.com>")
@@ -27,15 +28,21 @@ fn main() {
             .index(1))
         .get_matches();
     if let Some(i) = matches.value_of("INPUT") {
+        let conn_str =
+            std::env::var("DATABASE_URL").expect("Env var DATABASE_URL is required for this example.");
+        let pool = sqlx::AnyPool::connect(&conn_str).await?;
+
         println!("Step 1: Split all messages");
-        analyze_text(i, matches.value_of("cache").unwrap());
+        analyze_text(i, &pool, matches.value_of("cache").unwrap()).await;
 
         println!("Step 2: Post-processing of users");
-        walk_messages("messages");
+        walk_messages(&pool).await;
 
         println!("Step 3: Rewrite messages");
     } else {
         panic!("需要指定输入文件");
     }
+
+    Ok(())
 
 }

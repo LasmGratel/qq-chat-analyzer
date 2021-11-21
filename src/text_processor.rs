@@ -9,7 +9,8 @@ use futures::{FutureExt, StreamExt};
 use regex::Regex;
 use std::str::FromStr;
 use std::cmp::max;
-use rusqlite::Connection;
+use sqlx::{Pool, AnyPool, Error, Row};
+use sqlx::any::AnyRow;
 
 pub fn parse_user(sender: String, regex: &Regex) -> Option<User> {
     return if regex.is_match(&sender) {
@@ -28,22 +29,17 @@ pub fn parse_user(sender: String, regex: &Regex) -> Option<User> {
     }
 }
 
-pub fn get_senders() -> Option<HashSet<String>> {
-    let conn = Connection::open("msg.db").expect("Cannot open msg.db");
-    let mut statement = conn.prepare("SELECT sender FROM messages").unwrap();
-    let mut set = HashSet::new();
-    let mut rows = statement.query(rusqlite::params![]).unwrap();
-    while let Some(row) = rows.next().unwrap() {
-        set.insert(row.get::<usize, String>(0).unwrap() as String);
-    }
-    Some(set)
+pub async fn get_senders(pool: &AnyPool) -> Result<HashSet<String>, Error> {
+    sqlx::query("SELECT sender FROM messages")
+        .fetch_all(pool)
+        .await
+        .map(|x| HashSet::from_iter(x.into_iter().map(|y| y.get::<String, usize>(0))))
 }
 
-pub fn walk_messages(dir: &str) {
-
+pub async fn walk_messages(pool: &AnyPool) {
     let users: HashMap<String, User> = {
         let user_pattern = Regex::new(r"(?P<name>.+)((\((?P<qq>\d{6,})\))|(<(?P<email>.+@.+\..+)>))").unwrap();
-        let set: HashSet<String> = get_senders().unwrap();
+        let set: HashSet<String> = get_senders(pool).await.unwrap();
         let mut map: HashMap<String, User> = HashMap::new();
         set.into_iter()
             .map(|x| parse_user(x, &user_pattern))

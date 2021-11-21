@@ -15,4 +15,5 @@ anyhow = "1.0"
 uuid = { version = "0.8", features = ["serde", "v4"] }
 num_cpus = "1.13"
 clap = "3.0.0-beta.5"
-rusqlite = { version = "0.26", features = ["bundled"] }
+sqlx = { version = "0.5", features = [  "runtime-async-std-native-tls", "sqlite", "mysql", "any" ] }
+async-std = { version = "1", features = [ "attributes" ] }
