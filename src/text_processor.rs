@@ -9,7 +9,7 @@ use futures::{FutureExt, StreamExt};
 use regex::Regex;
 use std::str::FromStr;
 use std::cmp::max;
-use sqlx::{Pool, AnyPool, Error, Row};
+use sqlx::{Pool, AnyPool, Error, Row, AnyConnection, Connection};
 use sqlx::any::AnyRow;
 
 pub fn parse_user(sender: String, regex: &Regex) -> Option<User> {
@@ -29,17 +29,17 @@ pub fn parse_user(sender: String, regex: &Regex) -> Option<User> {
     }
 }
 
-pub async fn get_senders(pool: &AnyPool) -> Result<HashSet<String>, Error> {
+pub async fn get_senders(conn: &mut AnyConnection) -> Result<HashSet<String>, Error> {
     sqlx::query("SELECT sender FROM messages")
-        .fetch_all(pool)
+        .fetch_all(conn)
         .await
         .map(|x| HashSet::from_iter(x.into_iter().map(|y| y.get::<String, usize>(0))))
 }
 
-pub async fn walk_messages(pool: &AnyPool) {
+pub async fn walk_messages(conn: &mut AnyConnection) {
     let users: HashMap<String, User> = {
         let user_pattern = Regex::new(r"(?P<name>.+)((\((?P<qq>\d{6,})\))|(<(?P<email>.+@.+\..+)>))").unwrap();
-        let set: HashSet<String> = get_senders(pool).await.unwrap();
+        let set: HashSet<String> = get_senders(conn).await.unwrap();
         let mut map: HashMap<String, User> = HashMap::new();
         set.into_iter()
             .map(|x| parse_user(x, &user_pattern))

@@ -1,7 +1,7 @@
 use std::{fs, io};
 use std::path::Path;
 use std::fs::File;
-use std::io::{BufRead, Seek, BufReader};
+use std::io::{BufRead, Seek};
 use regex::Regex;
 use std::sync::{Arc};
 use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
@@ -13,7 +13,8 @@ use std::cmp::max;
 use std::thread::spawn;
 use std::time::Instant;
 use std::str::FromStr;
-use sqlx::{Connection, AnyPool, Executor, Transaction, Any};
+use sqlx::{Connection, AnyPool, Executor, Transaction, Any, AnyConnection};
+use futures::AsyncBufReadExt;
 
 fn read_messages(group: String, subject: String, lines: Vec<&String>, pool: AnyPool) -> Messages {
     let time_pattern = Regex::new(r"(?P<time>\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d) (?P<sender>.+)").unwrap();
@@ -60,18 +61,22 @@ fn read_messages(group: String, subject: String, lines: Vec<&String>, pool: AnyP
     messages
 }
 
-async fn insert_messages(messages: &Vec<Message>, pool: &AnyPool) -> Result<(), sqlx::Error> {
-    let mut transaction: Transaction<Any> = pool.begin().await?;
+async fn insert_messages(messages: &Vec<Message>, conn: &mut AnyConnection) -> Result<(), sqlx::Error> {
     for message in messages.into_iter() {
-        sqlx::query!("INSERT INTO messages (message_group, subject, is_group, sender, time, text) VALUES (?, ?, ?, ?, ?, ?)",
-            &message.message_group, &message.subject, &message.is_group, &message.sender, &message.time, &message.text)
-            .execute(&mut transaction)
+        sqlx::query("INSERT INTO messages (message_group, subject, is_group, sender, time, text) VALUES (?, ?, ?, ?, ?, ?)")
+            .bind(&message.message_group)
+            .bind(&message.subject)
+            .bind(&message.is_group)
+            .bind(&message.sender)
+            .bind(&message.time)
+            .bind(&message.text)
+            .execute(&mut *conn)
             .await?;
     }
     Ok(())
 }
 
-async fn walk_lines(path: &Path, pool: &AnyPool, buffer_size: usize) {
+async fn walk_lines(path: &Path, conn: &mut AnyConnection, buffer_size: usize) {
     let time_pattern = Regex::new(r"(?P<time>\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d) (?P<sender>.+)").unwrap();
 
     let mut group: Option<String> = None;
@@ -95,18 +100,20 @@ async fn walk_lines(path: &Path, pool: &AnyPool, buffer_size: usize) {
         .template("[{eta_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
         .progress_chars("##-"));
 
-    sqlx::query("DROP TABLE IF EXISTS messages").execute(pool).await.expect("Cannot drop table");
+    sqlx::query("DROP TABLE IF EXISTS messages").execute(&mut *conn).await.expect("Cannot drop table");
 
     sqlx::query("CREATE TABLE messages (
-                  id              INTEGER PRIMARY KEY,
-                  message_group TEXT not null ,
-                  subject TEXT not null ,
-                  is_group integer not null ,
-                  sender TEXT not null ,
-                  time TEXT not null ,
-                  text            TEXT NOT NULL
-                  );")
-        .execute(pool).await.expect("Cannot execute sql");
+              id              INTEGER PRIMARY KEY,
+              message_group TEXT not null ,
+              subject TEXT not null ,
+              is_group integer not null ,
+              sender TEXT not null ,
+              time TEXT not null ,
+              text            TEXT NOT NULL
+              );
+              PRAGMA journal_mode = WAL;
+              PRAGMA synchronous = NORMAL;")
+        .execute(&mut *conn).await.expect("Cannot execute sql");
 
     // let placeholders: String = (0..buffer_size).into_iter().map(|_| "(?, ?, ?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
 
@@ -143,7 +150,7 @@ async fn walk_lines(path: &Path, pool: &AnyPool, buffer_size: usize) {
                         buffer.push(message);
 
                         if buffer.len() == buffer_size {
-                            insert_messages(&buffer, pool).await.expect("Cannot insert message");
+                            insert_messages(&buffer, conn).await.expect("Cannot insert message");
                             buffer.clear();
                         }
                     }
@@ -175,7 +182,7 @@ async fn walk_lines(path: &Path, pool: &AnyPool, buffer_size: usize) {
 const LF: u8 = '\n' as u8;
 
 pub fn count_lines<R: io::Read>(handle: R) -> Result<usize, io::Error> {
-    let mut reader = BufReader::new(handle);
+    let mut reader = io::BufReader::new(handle);
     let mut count = 0;
     let mut line: Vec<u8> = Vec::new();
     while match reader.read_until(LF, &mut line) {
@@ -190,9 +197,9 @@ pub fn count_lines<R: io::Read>(handle: R) -> Result<usize, io::Error> {
     Ok(count)
 }
 
-pub async fn analyze_text<P>(path: P, pool: &AnyPool, buffer_size: &str)
+pub async fn analyze_text<P>(path: P, conn: &mut AnyConnection, buffer_size: &str)
     where P: AsRef<Path> {
-    walk_lines(path.as_ref(), pool, usize::from_str(buffer_size).unwrap()).await;
+    walk_lines(path.as_ref(), conn, usize::from_str(buffer_size).unwrap()).await;
 }
 
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>
