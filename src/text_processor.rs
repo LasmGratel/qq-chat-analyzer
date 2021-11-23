@@ -3,7 +3,7 @@ use futures::executor::{ThreadPool, block_on};
 use std::thread::spawn;
 use std::collections::{HashSet, HashMap};
 use futures::task::SpawnExt;
-use crate::message::{Messages, User};
+use crate::message::{User};
 use std::iter::FromIterator;
 use futures::{FutureExt, StreamExt};
 use regex::Regex;

@@ -8,65 +8,32 @@ use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
 use futures::channel::mpsc;
 use anyhow::Error;
 use uuid::Uuid;
-use crate::message::{Messages, Message};
+use crate::message::{Message};
 use std::cmp::max;
 use std::thread::spawn;
 use std::time::Instant;
 use std::str::FromStr;
 use sqlx::{Connection, AnyPool, Executor, Transaction, Any, AnyConnection};
 use futures::AsyncBufReadExt;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
+use std::cell::{RefCell, RefMut};
+use chrono::{DateTime, Local, Utc, TimeZone};
 
-fn read_messages(group: String, subject: String, lines: Vec<&String>, pool: AnyPool) -> Messages {
-    let time_pattern = Regex::new(r"(?P<time>\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d) (?P<sender>.+)").unwrap();
-    let group = group.strip_prefix("消息分组:").unwrap().to_string();
-    let subject = subject.strip_prefix("消息对象:").unwrap().to_string();
-    let mut messages = Messages {
-        is_group: group == "我的群聊" || group == "已退出的群" || group == "已退出的多人聊天",
-        group,
-        subject,
-        messages: vec![]
-    };
-    let mut flag = false;
-
-    let mut sender = "";
-    let mut time = "";
-
-    for line in lines.iter().skip_while(|x| !x.is_empty()) {
-        let line = line.trim();
-        if time_pattern.is_match(line) {
-            let caps = time_pattern.captures(line).unwrap();
-            let captured_time = caps.name("time").unwrap().as_str();
-            let captured_sender = caps.name("sender").unwrap().as_str();
-            time = captured_time;
-            sender = captured_sender;
-            flag = true;
-            continue;
-        }
-        if flag {
-            if !line.is_empty() {
-                messages.messages.push(Message {
-                    message_group: String::default(),
-                    subject: String::default(),
-                    is_group: false,
-                    sender: sender.to_string(),
-                    time: time.to_string(),
-                    text: line.to_string()
-                });
-            }
-
-            flag = false;
-            continue;
-        }
-    }
-    messages
+#[derive(Default)]
+struct Subject {
+    email: String,
+    is_group: bool,
+    qq: i32,
+    grouping: String,
+    nick: Vec<String>
 }
 
 async fn insert_messages(messages: &Vec<Message>, conn: &mut AnyConnection) -> Result<(), sqlx::Error> {
     for message in messages.into_iter() {
-        sqlx::query("INSERT INTO messages (message_group, subject, is_group, sender, time, text) VALUES (?, ?, ?, ?, ?, ?)")
-            .bind(&message.message_group)
+        sqlx::query("INSERT INTO messages (subject, grouping, sender, time, text) VALUES (?, ?, ?, ?, ?)")
             .bind(&message.subject)
-            .bind(&message.is_group)
+            .bind(&message.grouping)
             .bind(&message.sender)
             .bind(&message.time)
             .bind(&message.text)
@@ -76,7 +43,7 @@ async fn insert_messages(messages: &Vec<Message>, conn: &mut AnyConnection) -> R
     Ok(())
 }
 
-async fn walk_lines(path: &Path, conn: &mut AnyConnection, buffer_size: usize) {
+async fn walk_lines(path: &Path, conn: &mut AnyConnection, buffer_size: usize) -> Result<(), sqlx::Error> {
     let time_pattern = Regex::new(r"(?P<time>\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d) (?P<sender>.+)").unwrap();
 
     let mut group: Option<String> = None;
@@ -100,22 +67,39 @@ async fn walk_lines(path: &Path, conn: &mut AnyConnection, buffer_size: usize) {
         .template("[{eta_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
         .progress_chars("##-"));
 
-    sqlx::query("DROP TABLE IF EXISTS messages").execute(&mut *conn).await.expect("Cannot drop table");
+    sqlx::query("DROP TABLE IF EXISTS messages").execute(&mut *conn).await?;
 
     sqlx::query("CREATE TABLE messages (
-              id              INTEGER PRIMARY KEY,
-              message_group TEXT not null ,
-              subject TEXT not null ,
-              is_group integer not null ,
+              id              INTEGER PRIMARY KEY AUTOINCREMENT ,
+              subject INTEGER not null ,
+              grouping INTEGER not null ,
               sender TEXT not null ,
-              time TEXT not null ,
-              text            TEXT NOT NULL
+              time INTEGER not null ,
+              text TEXT NOT NULL
               );
+
+CREATE TABLE subjects (
+    id INTEGER PRIMARY KEY AUTOINCREMENT ,
+    is_group integer not null ,
+    name TEXT NOT NULL
+);
+
+CREATE TABLE groupings (
+    id INTEGER PRIMARY KEY AUTOINCREMENT ,
+    name TEXT NOT NULL
+);
+
               PRAGMA journal_mode = WAL;
               PRAGMA synchronous = NORMAL;")
-        .execute(&mut *conn).await.expect("Cannot execute sql");
+        .execute(&mut *conn)
+        .await?;
 
     // let placeholders: String = (0..buffer_size).into_iter().map(|_| "(?, ?, ?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
+
+    let mut subjects: Vec<(bool, String)> = vec![];
+    let mut groupings: Vec<String> = vec![];
+    let mut subject_map: HashMap<String, usize> = HashMap::new();
+    let mut grouping_map: HashMap<String, usize> = HashMap::new();
 
     for line in reader.lines() {
         lines_processed += 1;
@@ -136,21 +120,37 @@ async fn walk_lines(path: &Path, conn: &mut AnyConnection, buffer_size: usize) {
         } else {
             if group.is_some() && subject.is_some() {
                 if flag {
-                    let group = group.clone().unwrap();
-                    let subject = subject.clone().unwrap();
+                    let group = group.clone().unwrap().strip_prefix("消息分组:").unwrap().to_string();
+                    let subject = subject.clone().unwrap().strip_prefix("消息对象:").unwrap().to_string();
+                    let is_group = group == "我的群聊" || group == "已退出的群" || group == "已退出的多人聊天";
+                    let subject = if subject_map.contains_key(&subject) {
+                        *subject_map.get(&subject).unwrap()
+                    } else {
+                        subjects.push((is_group, subject.clone()));
+                        subject_map.insert(subject, subjects.len() - 1);
+                        subjects.len() - 1
+                    };
+
+                    let grouping = if grouping_map.contains_key(&group) {
+                        *grouping_map.get(&group).unwrap()
+                    } else {
+                        groupings.push(group.clone());
+                        grouping_map.insert(group, groupings.len() - 1);
+                        groupings.len() - 1
+                    };
                     if !trim_line.is_empty() {
+                        let time = Local.datetime_from_str(&time, "%Y-%m-%d %H:%M:%S").unwrap();
                         let message = Message {
-                            subject,
-                            is_group: group == "我的群聊" || group == "已退出的群" || group == "已退出的多人聊天",
-                            message_group: group,
-                            sender: sender.to_string(),
-                            time: time.to_string(),
+                            subject: subject as i64,
+                            sender: sender.clone(),
+                            grouping: grouping as i64,
+                            time: time.timestamp(),
                             text: line.to_string()
                         };
                         buffer.push(message);
 
                         if buffer.len() == buffer_size {
-                            insert_messages(&buffer, conn).await.expect("Cannot insert message");
+                            insert_messages(&buffer, conn).await?;
                             buffer.clear();
                         }
                     }
@@ -174,9 +174,27 @@ async fn walk_lines(path: &Path, conn: &mut AnyConnection, buffer_size: usize) {
 
     // drop(db_tx);
     progress_bar.finish();
+    
+    subject_map.clear();
+    grouping_map.clear();
+    for (is_group, name) in subjects.into_iter() {
+        sqlx::query("INSERT INTO subjects (is_group, name) VALUES (?, ?)")
+            .bind(is_group)
+            .bind(name)
+            .execute(&mut *conn)
+            .await?;
+    }
+    for name in groupings.into_iter() {
+        sqlx::query("INSERT INTO groupings (name) VALUES (?)")
+            .bind(name)
+            .execute(&mut *conn)
+            .await?;
+    }
 
     println!("Parsing complete");
     // db_thread.join();
+
+    Ok(())
 }
 
 const LF: u8 = '\n' as u8;
@@ -197,9 +215,9 @@ pub fn count_lines<R: io::Read>(handle: R) -> Result<usize, io::Error> {
     Ok(count)
 }
 
-pub async fn analyze_text<P>(path: P, conn: &mut AnyConnection, buffer_size: &str)
+pub async fn analyze_text<P>(path: P, conn: &mut AnyConnection, buffer_size: &str) -> Result<(), sqlx::Error>
     where P: AsRef<Path> {
-    walk_lines(path.as_ref(), conn, usize::from_str(buffer_size).unwrap()).await;
+    walk_lines(path.as_ref(), conn, usize::from_str(buffer_size).unwrap()).await
 }
 
 fn read_lines<P>(filename: P) -> io::Result<io::Lines<io::BufReader<File>>>

@@ -15,7 +15,7 @@ use sqlx::Connection;
 #[async_std::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let matches = App::new("QQ Chat Analyzer")
-        .version("1.0")
+        .version("0.2.0")
         .author("Lasm Gratel <lasm_gratel@hotmail.com>")
         .about("分析QQ的纯文本消息记录")
         .arg(Arg::new("cache")
@@ -34,7 +34,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut conn = sqlx::AnyConnection::connect(&conn_str).await?;
 
         println!("Step 1: Split all messages");
-        analyze_text(i, &mut conn, matches.value_of("cache").unwrap()).await;
+        analyze_text(i, &mut conn, matches.value_of("cache").unwrap()).await?;
 
         println!("Step 2: Post-processing of users");
         walk_messages(&mut conn).await;

@@ -35,10 +35,9 @@ pub struct Messages {
 
 #[derive(Debug, Serialize, Deserialize, Default, Hash, Clone)]
 pub struct Message {
-    pub message_group: String,
-    pub subject: String,
-    pub is_group: bool,
+    pub subject: i64,
     pub sender: String,
-    pub time: String,
+    pub grouping: i64,
+    pub time: i64,
     pub text: String
 }
