@@ -1,49 +1,45 @@
-use std::{fs, io};
+use std::{io};
 use std::path::Path;
 use std::fs::File;
-use std::io::{BufRead, Seek};
+use std::io::{BufRead};
 use regex::Regex;
-use std::sync::{Arc};
-use indicatif::{ProgressBar, ProgressIterator, ProgressStyle};
-use futures::channel::mpsc;
-use anyhow::Error;
-use uuid::Uuid;
+use indicatif::{ProgressBar, ProgressStyle};
 use crate::message::{Message};
-use std::cmp::max;
-use std::thread::spawn;
-use std::time::Instant;
 use std::str::FromStr;
-use sqlx::{Connection, AnyPool, Executor, Transaction, Any, AnyConnection};
+use sqlx::{Executor, Transaction, Any, AnyConnection, AnyPool};
 use futures::AsyncBufReadExt;
-use std::collections::{BTreeMap, HashMap, HashSet};
-use std::rc::Rc;
-use std::cell::{RefCell, RefMut};
-use chrono::{DateTime, Local, Utc, TimeZone};
+use std::collections::{HashMap, HashSet};
+use chrono::{Local, Utc, TimeZone};
+use std::collections::hash_map::Entry;
+use futures::executor::{block_on, ThreadPool};
+use futures::future::join_all;
+use futures::task::SpawnExt;
+use itertools::Itertools;
 
 #[derive(Default)]
 struct Subject {
     email: String,
     is_group: bool,
     qq: i32,
-    grouping: String,
+    group_id: String,
     nick: Vec<String>
 }
 
-async fn insert_messages(messages: &Vec<Message>, conn: &mut AnyConnection) -> Result<(), sqlx::Error> {
+async fn insert_messages(messages: Vec<Message>, conn: AnyPool) -> Result<(), sqlx::Error> {
     for message in messages.into_iter() {
-        sqlx::query("INSERT INTO messages (subject, grouping, sender, time, text) VALUES (?, ?, ?, ?, ?)")
+        sqlx::query("INSERT INTO messages (subject, group_id, sender, time, text) VALUES (?, ?, ?, ?, ?)")
             .bind(&message.subject)
-            .bind(&message.grouping)
+            .bind(&message.group_id)
             .bind(&message.sender)
             .bind(&message.time)
             .bind(&message.text)
-            .execute(&mut *conn)
+            .execute(&conn)
             .await?;
     }
     Ok(())
 }
 
-async fn walk_lines(path: &Path, conn: &mut AnyConnection, buffer_size: usize) -> Result<(), sqlx::Error> {
+async fn walk_lines(path: &Path, conn: AnyPool, buffer_size: usize) -> Result<(), sqlx::Error> {
     let time_pattern = Regex::new(r"(?P<time>\d\d\d\d-\d\d-\d\d \d\d:\d\d:\d\d) (?P<sender>.+)").unwrap();
 
     let mut group: Option<String> = None;
@@ -60,38 +56,44 @@ async fn walk_lines(path: &Path, conn: &mut AnyConnection, buffer_size: usize) -
     let mut lines_processed = 0usize;
 
     let file = File::open(path).expect("Cannot open");
-    let mut reader = io::BufReader::new(file);
+    let reader = io::BufReader::new(file);
 
     let progress_bar = ProgressBar::new(total_lines as u64);
     progress_bar.set_style(ProgressStyle::default_bar()
         .template("[{eta_precise}] {bar:40.cyan/blue} {pos:>7}/{len:7} {msg}")
         .progress_chars("##-"));
 
-    sqlx::query("DROP TABLE IF EXISTS messages").execute(&mut *conn).await?;
+    sqlx::query("DROP TABLE IF EXISTS messages;").execute(&conn).await?;
+    sqlx::query("DROP TABLE IF EXISTS subjects;").execute(&conn).await?;
+    sqlx::query("DROP TABLE IF EXISTS groupings;").execute(&conn).await?;
 
-    sqlx::query("CREATE TABLE messages (
-              id              INTEGER PRIMARY KEY AUTOINCREMENT ,
-              subject INTEGER not null ,
-              grouping INTEGER not null ,
-              sender TEXT not null ,
-              time INTEGER not null ,
-              text TEXT NOT NULL
-              );
+    sqlx::query("
+CREATE TABLE IF NOT EXISTS messages (
+    id INTEGER PRIMARY KEY AUTO_INCREMENT,
+    subject INTEGER not null,
+    group_id INTEGER not null,
+    sender TEXT not null,
+    time INTEGER not null,
+    text TEXT NOT NULL
+);")
+        .execute(&conn)
+        .await?;
 
-CREATE TABLE subjects (
-    id INTEGER PRIMARY KEY AUTOINCREMENT ,
-    is_group integer not null ,
+    sqlx::query("
+CREATE TABLE IF NOT EXISTS subjects (
+    id INTEGER PRIMARY KEY AUTO_INCREMENT,
+    is_group integer not null,
     name TEXT NOT NULL
-);
+);")
+        .execute(&conn)
+        .await?;
 
-CREATE TABLE groupings (
-    id INTEGER PRIMARY KEY AUTOINCREMENT ,
+    sqlx::query("
+CREATE TABLE IF NOT EXISTS groupings (
+    id INTEGER PRIMARY KEY AUTO_INCREMENT,
     name TEXT NOT NULL
-);
-
-              PRAGMA journal_mode = WAL;
-              PRAGMA synchronous = NORMAL;")
-        .execute(&mut *conn)
+);")
+        .execute(&conn)
         .await?;
 
     // let placeholders: String = (0..buffer_size).into_iter().map(|_| "(?, ?, ?, ?, ?, ?)").collect::<Vec<_>>().join(", ");
@@ -100,6 +102,9 @@ CREATE TABLE groupings (
     let mut groupings: Vec<String> = vec![];
     let mut subject_map: HashMap<String, usize> = HashMap::new();
     let mut grouping_map: HashMap<String, usize> = HashMap::new();
+
+    let mut jobs = vec![];
+    let thread_pool = ThreadPool::new().unwrap();
 
     for line in reader.lines() {
         lines_processed += 1;
@@ -117,57 +122,64 @@ CREATE TABLE groupings (
             subject = None;
         } else if trim_line.starts_with("消息对象:") {
             subject = Some(trim_line.to_string());
-        } else {
-            if group.is_some() && subject.is_some() {
-                if flag {
-                    let group = group.clone().unwrap().strip_prefix("消息分组:").unwrap().to_string();
-                    let subject = subject.clone().unwrap().strip_prefix("消息对象:").unwrap().to_string();
-                    let is_group = group == "我的群聊" || group == "已退出的群" || group == "已退出的多人聊天";
-                    let subject = if subject_map.contains_key(&subject) {
-                        *subject_map.get(&subject).unwrap()
-                    } else {
-                        subjects.push((is_group, subject.clone()));
-                        subject_map.insert(subject, subjects.len() - 1);
-                        subjects.len() - 1
-                    };
+        } else if group.is_some() && subject.is_some() {
+            if flag {
+                let group = group.clone().unwrap().strip_prefix("消息分组:").unwrap().to_string();
+                let subject = subject.clone().unwrap().strip_prefix("消息对象:").unwrap().to_string();
+                let is_group = group == "我的群聊" || group == "已退出的群" || group == "已退出的多人聊天";
+                let subject = if subject_map.contains_key(&subject) {
+                    *subject_map.get(&subject).unwrap()
+                } else {
+                    subjects.push((is_group, subject.clone()));
+                    subject_map.insert(subject, subjects.len() - 1);
+                    subjects.len() - 1
+                };
 
-                    let grouping = if grouping_map.contains_key(&group) {
-                        *grouping_map.get(&group).unwrap()
-                    } else {
-                        groupings.push(group.clone());
-                        grouping_map.insert(group, groupings.len() - 1);
-                        groupings.len() - 1
+                let group_id = if let Entry::Vacant(e) = grouping_map.entry(group.clone()) {
+                    groupings.push(group.clone());
+                    e.insert(groupings.len() - 1);
+                    groupings.len() - 1
+                } else {
+                    *grouping_map.get(&group).unwrap()
+                };
+                if !trim_line.is_empty() {
+                    let time = Local.datetime_from_str(&time, "%Y-%m-%d %H:%M:%S").unwrap();
+                    let message = Message {
+                        subject: subject as i64,
+                        sender: sender.clone(),
+                        group_id: group_id as i64,
+                        time: time.timestamp(),
+                        text: line.to_string()
                     };
-                    if !trim_line.is_empty() {
-                        let time = Local.datetime_from_str(&time, "%Y-%m-%d %H:%M:%S").unwrap();
-                        let message = Message {
-                            subject: subject as i64,
-                            sender: sender.clone(),
-                            grouping: grouping as i64,
-                            time: time.timestamp(),
-                            text: line.to_string()
-                        };
-                        buffer.push(message);
+                    buffer.push(message);
 
-                        if buffer.len() == buffer_size {
-                            insert_messages(&buffer, conn).await?;
-                            buffer.clear();
+                    if buffer.len() == buffer_size {
+                        let to_insert = buffer.clone();
+                        let conn = conn.clone();
+                        jobs.push(thread_pool.spawn_with_handle(async move {
+                            insert_messages(to_insert, conn).await.unwrap();
+                            Ok(())
+                        }).unwrap());
+                        if jobs.len() == 8 {
+                            block_on(join_all(jobs));
                         }
+                        jobs = vec![];
+                        buffer.clear();
                     }
-
-                    flag = false;
-                    continue;
                 }
 
-                if time_pattern.is_match(&line) {
-                    let caps = time_pattern.captures(&line).unwrap();
-                    let captured_time = caps.name("time").unwrap().as_str();
-                    let captured_sender = caps.name("sender").unwrap().as_str();
-                    time = captured_time.to_string();
-                    sender = captured_sender.to_string();
-                    flag = true;
-                    continue;
-                }
+                flag = false;
+                continue;
+            }
+
+            if time_pattern.is_match(&line) {
+                let caps = time_pattern.captures(&line).unwrap();
+                let captured_time = caps.name("time").unwrap().as_str();
+                let captured_sender = caps.name("sender").unwrap().as_str();
+                time = captured_time.to_string();
+                sender = captured_sender.to_string();
+                flag = true;
+                continue;
             }
         }
     }
@@ -178,18 +190,27 @@ CREATE TABLE groupings (
     subject_map.clear();
     grouping_map.clear();
     for (is_group, name) in subjects.into_iter() {
-        sqlx::query("INSERT INTO subjects (is_group, name) VALUES (?, ?)")
-            .bind(is_group)
-            .bind(name)
-            .execute(&mut *conn)
-            .await?;
+        let conn = conn.clone();
+        jobs.push(thread_pool.spawn_with_handle(async move {
+            sqlx::query("INSERT INTO subjects (is_group, name) VALUES (?, ?)")
+                .bind(is_group)
+                .bind(name)
+                .execute(&conn)
+                .await.map(|_| ())
+        }).unwrap());
     }
     for name in groupings.into_iter() {
-        sqlx::query("INSERT INTO groupings (name) VALUES (?)")
-            .bind(name)
-            .execute(&mut *conn)
-            .await?;
+        let conn = conn.clone();
+        jobs.push(thread_pool.spawn_with_handle(async move {
+            sqlx::query("INSERT INTO groupings (name) VALUES (?)")
+                .bind(name)
+                .execute(&conn)
+                .await.map(|_| ())
+        }).unwrap());
     }
+
+    println!("Waiting database");
+    join_all(jobs.into_iter()).await;
 
     println!("Parsing complete");
     // db_thread.join();
@@ -197,7 +218,7 @@ CREATE TABLE groupings (
     Ok(())
 }
 
-const LF: u8 = '\n' as u8;
+const LF: u8 = b'\n';
 
 pub fn count_lines<R: io::Read>(handle: R) -> Result<usize, io::Error> {
     let mut reader = io::BufReader::new(handle);
@@ -215,7 +236,7 @@ pub fn count_lines<R: io::Read>(handle: R) -> Result<usize, io::Error> {
     Ok(count)
 }
 
-pub async fn analyze_text<P>(path: P, conn: &mut AnyConnection, buffer_size: &str) -> Result<(), sqlx::Error>
+pub async fn analyze_text<P>(path: P, conn: AnyPool, buffer_size: &str) -> Result<(), sqlx::Error>
     where P: AsRef<Path> {
     walk_lines(path.as_ref(), conn, usize::from_str(buffer_size).unwrap()).await
 }

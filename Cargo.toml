@@ -18,3 +18,4 @@ clap = "3.0.0-beta.5"
 sqlx = { version = "0.5", features = [  "runtime-async-std-native-tls", "sqlite", "mysql", "any" ] }
 async-std = { version = "1", features = [ "attributes" ] }
 chrono = "0.4.19"
+itertools = "0.10"

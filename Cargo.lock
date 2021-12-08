@@ -1153,6 +1153,7 @@ dependencies = [
  "clap",
  "futures",
  "indicatif",
+ "itertools",
  "num_cpus",
  "regex",
  "serde",
